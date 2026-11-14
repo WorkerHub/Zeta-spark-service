@@ -1,6 +1,6 @@
 # Zeta-spark-service
 
-一个极薄的 Spark SQL HTTP 服务：容器里常驻一个 SparkSession（Local 模式），提供健康检查、执行 SQL、取消在途查询三个接口。库表数据持久化在数据卷里，重启不丢。
+一个极薄的 Spark SQL HTTP 服务：容器里常驻一个 SparkSession（Local 模式），提供健康检查、执行 SQL、取消在途查询三个接口，外加一套配置接口：会话级的运行时配置随查询下发，启动级配置（驱动内存、jar、扩展）可通过接口排空重建生效。库表数据持久化在数据卷里，重启不丢。
 
 本服务是为 [Zeta](https://github.com/WorkerHub/Zeta) 支持 SparkSQL 而开发的**可选组件**：Zeta 本身不内置 Spark 引擎，不用 SparkSQL 就无需部署；要用时部署一个本服务作为后端（一台实例对应 Zeta 里登记的一个 Spark 数据源）。推荐部署平台 **Instabox**。
 
@@ -46,8 +46,10 @@ docker run -d --name spark-sql-service \
 ### `GET /health`
 
 ```json
-{"ok": true, "sparkVersion": "3.5.3"}
+{"ok": true, "sparkVersion": "3.5.3", "state": "running", "epoch": 1}
 ```
+
+`state` 为实例配置重建状态（见下节），`epoch` 为当前 Spark 环境代次、每次重建 +1。
 
 自愈：内置看门狗每 30 秒探活 Spark 网关，JVM 已死时连续两次探活失败即退出进程，由 Docker 重启策略拉起恢复（会话状态清空，metastore 数据不受影响）。
 
@@ -65,8 +67,9 @@ docker run -d --name spark-sql-service \
 | `maxRows` | 最多返回行数，硬上限 5000 |
 | `session` | 可选。多会话标识（≤128 字符）：同标识共享当前库、临时视图与会话配置，不同标识互相隔离；库表（metastore）全会话共享。不传则走默认会话 |
 | `execution` | 可选。执行 ID（≤128 字符），与 `/cancel` 配合按次取消 |
+| `config` | 可选。运行时配置对象（键值均为字符串），仅限命名会话：执行前应用到该会话（`conf.set`）。只接受 Spark 已注册的运行时键（SQLConf 可改项，如 `spark.sql.shuffle.partitions`）；启动级键返回 400 `{"code": "startup_key_in_profile", "key": "..."}`，未注册/非法键返回 400 `{"code": "invalid_key", ...}`——启动级参数请走下面的实例配置 |
 
-成功返回 `{"columns": ["1"], "rows": [[1]], "rowCount": 1, "truncated": false}`。错误形态：令牌缺失/错误 → 401 `{"error": "unauthorized"}`；请求体不合法 → 400；SQL 执行出错 → 200 + `{"error": "..."}`。
+成功返回 `{"columns": ["1"], "rows": [[1]], "rowCount": 1, "truncated": false, "epoch": 1}`。错误形态：令牌缺失/错误 → 401 `{"error": "unauthorized"}`；请求体不合法 → 400；SQL 执行出错 → 200 + `{"error": "..."}`。实例配置重建期间的查询返回 503 `{"code": "context_draining"|"context_restarting", "inflight": n}`；重建后旧会话名首次查询返回 409 `{"code": "context_rebuilt", "epoch": n}`，之后可正常重新连接。
 
 ### `POST /cancel`
 
@@ -75,6 +78,22 @@ docker run -d --name spark-sql-service \
 - 提供 `execution` 时只取消该次执行的 job group（`session:execution`），迟到的取消不误杀同会话下一条执行；不提供则按会话级取消
 - 实现：执行时按会话（或会话:执行）设置 Spark job group，取消时另一线程调 `cancelJobGroup`；会话与 SparkSession 不销毁，临时视图与当前库保留
 - 无在途 job 时同样返回 `{"ok": true}`（幂等）；被取消的查询以 200 + `{"error": "… cancelled …"}` 返回；鉴权与请求体规则同 `/query`
+
+### 实例配置：`POST /admin/config/apply`、`GET /admin/config/status`、`GET /admin/jars`
+
+启动级参数（`spark.driver.memory`、`spark.sql.extensions`、catalog 实现类等）与 jar 通过接口管理，鉴权同 `/query`：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/admin/config/apply \
+  -H "X-Auth-Token: 你的令牌" -H "Content-Type: application/json" \
+  -d '{"entries": {"spark.driver.memory": "4g"},
+       "jars": [{"type": "url", "value": "https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.2.0/delta-spark_2.12-3.2.0.jar"},
+                {"type": "file", "value": "my-udf.jar"}]}'
+```
+
+- `entries` 是完整的期望配置（与环境变量基础值合并，条目覆盖基础值）；`spark.master`、`spark.jars`、warehouse/本地目录等服务自管键不接受。`jars` 里 `url` 由服务端下载到数据目录的 `jars/` 并缓存（可附 `sha256` 校验），`file` 引用已运维放置在 `jars/` 里的文件；jar 清单查 `GET /admin/jars`。
+- apply 返回 202 后异步执行：落盘期望配置 → **排空**（在跑查询长短都等自然结束，新查询 503 拒绝）→ 停旧环境、以新配置启动新 JVM（驱动内存真实生效）→ `epoch` +1、旧会话失效。进度与生效配置查 `GET /admin/config/status`：`{"state": "running|draining|restarting|failed_fallback", "epoch": n, "inflight": n, "effective": {...}, "lastError": ...}`。
+- **保险丝**：新配置起不来（启动期校验含目录/metastore 可用性）自动回退上一个可用配置继续服务，状态置 `failed_fallback` 并记录 `lastError`；写坏的配置不会把实例搞砖。注意 Spark 对不存在的扩展类只警告、不用它（不算启动失败），catalog 实现类不存在则会启动失败并触发回退。
 
 试一句：
 
@@ -103,6 +122,8 @@ curl -s -X POST http://127.0.0.1:8080/query \
 - `metastore_db/`：Derby 数据库，存库/表定义
 - `warehouse/`：托管表数据，一库一子目录、一表一子目录，Parquet 格式
 - `tmp/`：Spark 本地临时目录
+- `config/`：实例配置的期望值与上一个可用值（`desired.json` / `last-good.json`），启动时按此顺序兜底装载
+- `jars/`：接口下载缓存的 jar 与运维放置的私有 jar
 
 临时视图与会话状态只在内存里，服务重启即清（库表不受影响）。令牌是唯一的门：用随机长令牌，不要提交进 git；对外只走带鉴权的反向代理或隧道。
 
